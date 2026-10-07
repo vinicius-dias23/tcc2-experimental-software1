@@ -16,6 +16,16 @@ Definições (Seção 4.5 e Cenário 1):
 - violação de ordem: mensagem de pedido com versão menor que outra já recebida do mesmo pedido.
 - divergência final: pedidos tocados cuja (versão, status) difere entre origem e destino,
   ou cuja contagem de itens/pagamentos difere.
+
+Seções extras, conforme o cenário gravado em marcos.json:
+- Cenário 2 (promoção de réplica): transações confirmadas ao cliente que a réplica promovida
+  não tem, eventos órfãos (dessas transações, as que chegaram ao destino) e divergência de
+  conteúdo. As transações perdidas na promoção saem do oráculo geral, porque a origem não as
+  tem mais; elas são contadas à parte.
+- Cenário 3 (reinícios repetidos): operações sem resposta (o serviço morreu no meio) são
+  resolvidas pela versão do pedido na origem, que sobe 1 a cada commit.
+- Cenário 5 (queda de consumidor): rebalanceamentos e tempo fora do estado Stable, lidos de
+  grupo.csv, e expulsões por max.poll.interval.
 """
 
 from __future__ import annotations
@@ -94,6 +104,28 @@ def analisar(pasta: Path) -> dict:
                 commitadas[r["correlation_id"]] = r
             else:
                 ambiguas += 1
+
+    extras: dict = {}
+    if m.get("resolver_ambiguas"):
+        resolvidas, ambiguas, extras["ambiguas"] = _resolver_ambiguas(ledger, origem)
+        commitadas.update(resolvidas)
+    perdidas_promocao: dict[str, dict] = {}
+    if m.get("cenario") == 2:
+        perdidas_promocao, extras["promocao"] = _promocao(pasta, m, ledger, msgs, origem, destino, serie)
+        for corr in perdidas_promocao:
+            commitadas.pop(corr, None)
+    if m.get("cenario") == 3:
+        ciclos = _ler(pasta / "ciclos.csv")
+        prontos = [float(c["tempo_ate_pronto_s"]) for c in ciclos if c["tempo_ate_pronto_s"]]
+        extras["reinicios"] = {
+            "componente": m.get("parametros", {}).get("componente"),
+            "ciclos": len(ciclos),
+            "ciclos_sem_voltar": len(ciclos) - len(prontos),
+            "tempo_ate_pronto_medio_s": round(statistics.mean(prontos), 2) if prontos else None,
+            "tempo_fora_total_s": round(sum(prontos), 1),
+        }
+    if m.get("cenario") == 5:
+        extras["grupo"] = _grupo(pasta, m, serie)
 
     por_corr: dict[str, Counter] = defaultdict(Counter)
     for x in msgs:
@@ -224,9 +256,139 @@ def analisar(pasta: Path) -> dict:
         },
         "tempos": tempos,
         "efeito_colateral": colateral,
+        **extras,
     }
     (pasta / "resumo.json").write_text(json.dumps(resumo, indent=2, ensure_ascii=False))
     return resumo
+
+
+def _ok(r: dict) -> bool:
+    return r["http_status"].isdigit() and 200 <= int(r["http_status"]) < 300
+
+
+def _resolver_ambiguas(ledger: list[dict], origem: dict) -> tuple[dict[str, dict], int, dict]:
+    """Decide, pela versão, se as operações sem resposta (status 0) chegaram a ser commitadas.
+
+    As operações de um pedido são sequenciais e cada commit soma 1 à versão. Entre duas
+    respostas 2xx com versões v1 e v2 houve v2 - v1 - 1 commits sem resposta; depois da
+    última, a versão final da origem diz quantos houve. Se esse número bate com a quantidade
+    de operações sem resposta do trecho (ou é zero), todas foram (ou nenhuma foi) commitadas.
+    Caso contrário o trecho fica sem decisão e sai do oráculo."""
+    por_pedido: dict[str, list[dict]] = defaultdict(list)
+    for r in ledger:
+        por_pedido[r["order_id"]].append(r)
+    commitadas: dict[str, dict] = {}
+    cont = Counter()
+    for oid, ops in por_pedido.items():
+        ops.sort(key=lambda r: float(r["t_envio"]))
+        anterior, trecho = 0, []
+
+        def fechar(proxima: int) -> None:
+            if not trecho:
+                return
+            n = proxima - anterior - 1
+            if n == len(trecho):
+                cont["commitadas"] += n
+                commitadas.update({r["correlation_id"]: r for r in trecho})
+            elif n <= 0:
+                cont["nao_commitadas"] += len(trecho)
+            else:
+                cont["sem_decisao"] += len(trecho)
+
+        for r in ops:
+            if _ok(r) and r["versao"]:
+                fechar(int(r["versao"]))
+                trecho, anterior = [], int(r["versao"])
+            elif r["http_status"] in ("", "0"):
+                trecho.append(r)
+        fechar(int(origem[oid]["version"]) + 1 if oid in origem else 1)
+    return commitadas, cont["sem_decisao"], {
+        "sem_resposta": sum(cont.values()), "commitadas": cont["commitadas"],
+        "nao_commitadas": cont["nao_commitadas"], "sem_decisao": cont["sem_decisao"]}
+
+
+def _lsn(v: str | None) -> int | None:
+    if not v:
+        return None
+    a, _, b = v.partition("/")
+    return (int(a, 16) << 32) + int(b, 16)
+
+
+def _promocao(pasta: Path, m: dict, ledger: list[dict], msgs: list[dict], origem: dict, destino: dict,
+              serie: list[dict]) -> tuple[dict[str, dict], dict]:
+    """Cenário 2: o que a promoção da réplica apagou e o que disso chegou ao destino."""
+    retrato = {r["order_id"]: r for r in _ler(pasta / "origem_pos_promocao.csv")}
+    queda = m.get("primario_derrubado") or float("inf")
+    # Antes de a réplica assumir o endereço, nenhuma escrita chega a ela: toda resposta 2xx
+    # recebida até ali veio de um commit no primário antigo. Respostas posteriores podem ser de
+    # requisições que esperaram a conexão e commitaram já no novo primário.
+    troca = m.get("endereco_trocado") or m.get("falha_fim") or float("inf")
+    perdidas: dict[str, dict] = {}
+    for r in ledger:
+        if not _ok(r) or not r["versao"] or float(r["t_resposta"]) > troca:
+            continue
+        s = retrato.get(r["order_id"])
+        if s is None or int(s["version"]) < int(r["versao"]):
+            perdidas[r["correlation_id"]] = r
+    recebidas = {x["correlation_id"] for x in msgs if x["correlation_id"]}
+    orfaos = [c for c in perdidas if c in recebidas]
+
+    so_destino = [k for k in destino if k not in origem]
+    adiantado = sum(1 for k, d in destino.items() if k in origem and int(d["version"]) > int(origem[k]["version"]))
+    conflito = sum(1 for k, d in destino.items() if k in origem and d["version"] == origem[k]["version"]
+                   and d["last_correlation_id"] != origem[k]["last_correlation_id"])
+
+    ref = m.get("promocao_concluida") or queda
+    ausente = recriado = None
+    for x in serie:
+        t = float(x["t"])
+        if t < queda or x.get("origem_disponivel") != "1":
+            continue
+        tem_slot = x.get("slot_ativo") not in ("", None)
+        if ausente is None and not tem_slot:
+            ausente = round(t - ref, 2)
+        elif ausente is not None and tem_slot and recriado is None:
+            recriado = round(t - ref, 2)
+    antes, depois = _lsn(m.get("lsn_primario_na_queda")), _lsn(m.get("lsn_replica_na_promocao"))
+    return perdidas, {
+        "transacoes_perdidas_na_promocao": len(perdidas),
+        "criacoes_perdidas": sum(1 for r in perdidas.values() if r["operacao"] == "create"),
+        "eventos_orfaos": len(orfaos),
+        "wal_nao_replicado_bytes": antes - depois if antes is not None and depois is not None else None,
+        "conteudo_final": {
+            "pedidos_so_no_destino": len(so_destino),
+            "destino_com_versao_maior": adiantado,
+            "mesma_versao_conteudo_diferente": conflito,
+        },
+        "slot_ausente_apos_promocao_s": ausente if m["modo"] == "cdc" else None,
+        "slot_recriado_apos_promocao_s": recriado if m["modo"] == "cdc" else None,
+    }
+
+
+def _grupo(pasta: Path, m: dict, serie: list[dict]) -> dict:
+    """Cenário 5: rebalanceamentos e tempo fora do estado Stable por fase, a partir de grupo.csv."""
+    linhas = [r for r in _ler(pasta / "grupo.csv") if r["estado"]]
+    fases = ("regime", "falha", "recuperacao", "estabilizacao")
+    reb, nao_estavel = Counter(), Counter()
+    for a, b in zip(linhas, linhas[1:]):
+        t = float(a["t"])
+        fase = _fase(t, m) if t < (m.get("carga_fim") or float("inf")) else "estabilizacao"
+        if a["estado"] != "Stable":
+            nao_estavel[fase] += float(b["t"]) - t
+        if a["estado"] == "Stable" and b["estado"] != "Stable":
+            reb[_fase(float(b["t"]), m) if float(b["t"]) < (m.get("carga_fim") or float("inf")) else "estabilizacao"] += 1
+
+    def delta(campo: str, fase: str) -> int | None:
+        vals = [float(s[campo]) for s in serie if s.get(campo) not in ("", None) and s["fase"] == fase]
+        return int(max(vals) - min(vals)) if vals else None
+
+    return {
+        "rebalanceamentos": {f: reb[f] for f in fases},
+        "tempo_nao_estavel_s": {f: round(nao_estavel[f], 1) for f in fases},
+        "membros_min": min((int(r["membros"]) for r in linhas), default=None),
+        "membros_max": max((int(r["membros"]) for r in linhas), default=None),
+        "expulsoes_max_poll": {f: delta("consumidor_expulsoes", f) for f in fases},
+    }
 
 
 def imprimir(r: dict) -> None:
@@ -242,6 +404,9 @@ def imprimir(r: dict) -> None:
     print(f"  divergência final={i['divergencia_final']}")
     print(f"  tempos={r['tempos']}")
     print(f"  efeito colateral={r['efeito_colateral']}")
+    for chave in ("ambiguas", "reinicios", "promocao", "grupo"):
+        if chave in r:
+            print(f"  {chave}={r[chave]}")
 
 
 if __name__ == "__main__":

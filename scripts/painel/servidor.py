@@ -1,5 +1,5 @@
 """Painel web dos protótipos: diagrama dos serviços com o estado de cada um ao vivo,
-vazão entre eles e botões para injetar falhas e disparar os scripts de carga e do Cenário 1.
+vazão entre eles e botões para injetar falhas e disparar os scripts de carga e dos cenários.
 
 Roda na máquina, fora do Docker Compose, para sobreviver ao `down -v` que os scripts fazem
 entre execuções:
@@ -8,8 +8,9 @@ entre execuções:
   python -m scripts.painel --porta 9000
 
 O painel lê o estado dos contêineres com `docker compose ps`, os /healthz e /metrics dos
-serviços, o status do conector Debezium e o slot de replicação no banco de origem. As falhas
-são os mesmos comandos que o Cenário 1 usa (`docker compose stop|kill|pause`).
+serviços, o status do conector Debezium e o slot de replicação no banco de origem, a réplica
+da origem (Cenário 2) e o estado do grupo de consumo (Cenário 5). As falhas são os mesmos
+comandos que os scripts dos cenários usam (`docker compose stop|kill|pause`, failover).
 """
 
 from __future__ import annotations
@@ -38,11 +39,14 @@ PROFILES = ["--profile", "domain-events", "--profile", "cdc"]
 # debezium-connector-init) e os marcadores backend-* ficam de fora: reiniciá-los recarregaria
 # as bases ou registraria o conector de novo.
 ALVOS = {
-    "postgres-origem", "postgres-destino", *amb.BROKERS, "kafka-connect",
-    "order-service-domain-events", "shipping-service-domain-events",
-    "order-service-cdc", "shipping-service-cdc",
+    "postgres-origem", "postgres-destino", amb.REPLICA, *amb.BROKERS, "kafka-connect",
+    "order-service-domain-events", "order-service-cdc",
+    *(amb.consumidor(m, i) for m in amb.MODOS for i in amb.PORTAS_CONSUMIDORES),
 }
-ACOES = {"stop", "kill", "pause", "unpause", "start", "restart"}
+# "subir" cria e liga um serviço que ainda não existe (réplica e consumidores extras).
+ACOES = {"stop", "kill", "pause", "unpause", "start", "restart", "subir"}
+RELIGAM = {"start", "restart", "unpause", "subir"}
+CENARIOS = {"cenario1", "cenario2", "cenario3", "cenario5"}
 
 # Métricas lidas do /metrics, acumuladas como séries de taxa (por segundo).
 METRICAS_ORDER = ["orders_created_total", "order_status_changes_total", "http_errors_total",
@@ -153,20 +157,30 @@ class Painel:
 
     async def _amostrar(self, sessao: aiohttp.ClientSession) -> None:
         t = time.time()
-        conteineres, order_h, ship_h, m_order, m_ship, origem = await asyncio.gather(
-            self._conteineres(), self._healthz(sessao, amb.API_URL), self._healthz(sessao, amb.CONSUMIDOR_URL),
-            amb.ler_metricas(sessao, amb.API_URL), amb.ler_metricas(sessao, amb.CONSUMIDOR_URL),
-            self._origem_slot())
+        instancias = list(amb.PORTAS_CONSUMIDORES)
+        conteineres, order_h, m_order, origem, replica, *por_instancia = await asyncio.gather(
+            self._conteineres(), self._healthz(sessao, amb.API_URL), amb.ler_metricas(sessao, amb.API_URL),
+            self._origem_slot(), self._replica(),
+            *(self._healthz(sessao, amb.url_consumidor(i)) for i in instancias),
+            *(amb.ler_metricas(sessao, amb.url_consumidor(i)) for i in instancias))
+        saude_inst, metr_inst = por_instancia[:len(instancias)], por_instancia[len(instancias):]
         modo = self._detectar_modo(conteineres, order_h)
         conector = await self._conector(sessao) if modo == "cdc" else None
+        grupo = await self._grupo(sessao, [i for i, h in zip(instancias, saude_inst) if h.get("ok")])
 
-        metricas = {k: m_order.get(k) for k in METRICAS_ORDER} | {k: m_ship.get(k) for k in METRICAS_SHIPPING}
+        # As métricas do consumidor são a soma das instâncias que responderam.
+        m_ship = {k: sum(m[k] for m in metr_inst if k in m) if any(k in m for m in metr_inst) else None
+                  for k in METRICAS_SHIPPING + ["group_expulsions_total"]}
+        metricas = {k: m_order.get(k) for k in METRICAS_ORDER} | m_ship
         taxas = self._taxas(t, metricas)
-        self._detectar_mudancas(conteineres, conector)
+        self._detectar_mudancas(conteineres, conector, grupo, replica)
 
         self.estado = {"t": t, "modo": modo, "conteineres": conteineres,
-                       "healthz": {"order": order_h, "shipping": ship_h},
-                       "metricas": metricas, "taxas": taxas, "conector": conector, "origem": origem}
+                       "healthz": {"order": order_h, "shipping": saude_inst[0]},
+                       "consumidores": {i: {"healthz": h, "metricas": {k: m.get(k) for k in METRICAS_SHIPPING}}
+                                        for i, h, m in zip(instancias, saude_inst, metr_inst)},
+                       "metricas": metricas, "taxas": taxas, "conector": conector, "origem": origem,
+                       "replica": replica, "grupo": grupo}
         fora = sorted(s for s, c in conteineres.items() if s in ALVOS and c["estado"] != "running")
         self.historico.append({"t": t, **taxas, "fora": fora,
                                "slot_atraso_bytes": (origem or {}).get("slot_atraso_bytes")})
@@ -227,11 +241,13 @@ class Painel:
             cur = await asyncio.wait_for(self._origem.execute("""
                 SELECT s.active,
                        pg_wal_lsn_diff(pg_current_wal_lsn(), s.restart_lsn)::bigint,
-                       pg_wal_lsn_diff(pg_current_wal_lsn(), s.confirmed_flush_lsn)::bigint
+                       pg_wal_lsn_diff(pg_current_wal_lsn(), s.confirmed_flush_lsn)::bigint,
+                       (SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), r.replay_lsn)::bigint FROM pg_stat_replication r
+                         WHERE r.application_name NOT LIKE 'Debezium%%' LIMIT 1)
                   FROM (SELECT 1) x LEFT JOIN pg_replication_slots s ON s.slot_name = %s""", (amb.SLOT,)), 3)
-            ativo, retido, atraso = await cur.fetchone()
+            ativo, retido, atraso, replica = await cur.fetchone()
             return {"disponivel": True, "slot_existe": ativo is not None, "slot_ativo": ativo,
-                    "slot_retido_bytes": retido, "slot_atraso_bytes": atraso}
+                    "slot_retido_bytes": retido, "slot_atraso_bytes": atraso, "replica_atraso_bytes": replica}
         except Exception as e:
             if self._origem is not None:
                 try:
@@ -240,6 +256,34 @@ class Painel:
                     pass
             self._origem = None
             return {"disponivel": False, "erro": type(e).__name__}
+
+    async def _replica(self) -> dict | None:
+        """Papel da réplica da origem (standby ou primário promovido) e, se promovida, o slot."""
+        try:
+            async with await psycopg.AsyncConnection.connect(amb.REPLICA_DSN, autocommit=True, connect_timeout=1) as c:
+                cur = await asyncio.wait_for(c.execute("""
+                    SELECT pg_is_in_recovery(), s.active,
+                           CASE WHEN pg_is_in_recovery() THEN NULL
+                                ELSE pg_wal_lsn_diff(pg_current_wal_lsn(), s.confirmed_flush_lsn)::bigint END
+                      FROM (SELECT 1) x LEFT JOIN pg_replication_slots s ON s.slot_name = %s""", (amb.SLOT,)), 3)
+                standby, ativo, atraso = await cur.fetchone()
+            return {"disponivel": True, "papel": "standby" if standby else "primario",
+                    "slot_existe": ativo is not None, "slot_ativo": ativo, "slot_atraso_bytes": atraso}
+        except Exception as e:
+            return {"disponivel": False, "erro": type(e).__name__}
+
+    async def _grupo(self, sessao: aiohttp.ClientSession, vivas: list[int]) -> dict | None:
+        """Estado do grupo de consumo no coordenador, perguntado a uma instância que responde."""
+        for i in vivas:
+            try:
+                async with sessao.get(f"{amb.url_consumidor(i)}/group", timeout=aiohttp.ClientTimeout(total=2)) as r:
+                    if r.status == 200:
+                        g = await r.json()
+                        return {"estado": g.get("state"), "membros": g.get("members"),
+                                "por_host": g.get("members_by_host") or {}}
+            except Exception:
+                continue
+        return None
 
     def _taxas(self, t: float, metricas: dict) -> dict:
         anterior, self._anterior_metricas = self._anterior_metricas, {"t": t, **metricas}
@@ -256,7 +300,19 @@ class Painel:
             taxas["api_commits_s"] = None
         return taxas
 
-    def _detectar_mudancas(self, conteineres: dict, conector: dict | None) -> None:
+    def _detectar_mudancas(self, conteineres: dict, conector: dict | None, grupo: dict | None = None,
+                           replica: dict | None = None) -> None:
+        estado_grupo = (grupo or {}).get("estado")
+        if estado_grupo and estado_grupo != getattr(self, "_anterior_grupo", None):
+            if getattr(self, "_anterior_grupo", None):
+                self.registrar(f"grupo de consumo: {self._anterior_grupo} → {estado_grupo} ({grupo['membros']} membros)",
+                               "recuperacao" if estado_grupo == "Stable" else "falha")
+            self._anterior_grupo = estado_grupo
+        papel = (replica or {}).get("papel")
+        if papel and papel != getattr(self, "_anterior_papel", None):
+            if getattr(self, "_anterior_papel", None):
+                self.registrar(f"réplica da origem: {self._anterior_papel} → {papel}", "info")
+            self._anterior_papel = papel
         if "_erro" in conteineres:
             return
         atuais = {s: c["estado"] for s, c in conteineres.items() if s in ALVOS}
@@ -276,7 +332,7 @@ class Painel:
     # ------------------------------------------------------------------ ações
     def _trabalho_bloqueia_falhas(self) -> str | None:
         t = self.trabalho
-        if t and t.fim is None and t.tipo in ("cenario1", "ambiente"):
+        if t and t.fim is None and (t.tipo in CENARIOS or t.tipo == "ambiente"):
             return f"aguarde: '{t.descricao}' está em andamento e controla os contêineres"
         return None
 
@@ -288,8 +344,19 @@ class Painel:
             raise web.HTTPBadRequest(text=f"serviço inválido: {', '.join(invalidos) or '(nenhum)'}")
         if bloqueio := self._trabalho_bloqueia_falhas():
             raise web.HTTPConflict(text=bloqueio)
-        self.registrar(f"painel: docker compose {acao} {' '.join(servicos)}", "acao")
-        rc, out, err = await compose(acao, *servicos)
+        if acao in RELIGAM and amb.PRIMARIO in servicos and self._replica_promovida():
+            raise web.HTTPConflict(text="a réplica já foi promovida e responde pelo nome postgres-origem; religar o "
+                                        "primário antigo criaria dois primários com o mesmo nome. Suba o backend de "
+                                        "novo (Scripts) para refazer o ambiente.")
+        comando = ["up", "-d", "--no-deps", *servicos] if acao == "subir" else [acao, *servicos]
+        if acao == "start":
+            # docker start direto: o `compose start` religaria também o seed e o kafka-init.
+            self.registrar(f"painel: docker start {' '.join(servicos)}", "acao")
+            rc, out = await amb.ligar_async(*servicos)
+            err = ""
+        else:
+            self.registrar(f"painel: docker compose {' '.join(comando)}", "acao")
+            rc, out, err = await compose(*comando)
         if rc != 0:
             self.registrar(f"falhou: {(err or out).strip()[:300]}", "erro")
         return {"ok": rc == 0, "saida": (out + err).strip()}
@@ -301,6 +368,9 @@ class Painel:
         cont = self.estado.get("conteineres", {})
         congelados = [s for s, c in cont.items() if s in ALVOS and c["estado"] == "paused"]
         parados = [s for s, c in cont.items() if s in ALVOS and c["estado"] in ("exited", "created", "dead")]
+        if self._replica_promovida() and amb.PRIMARIO in parados:
+            parados.remove(amb.PRIMARIO)
+            self.registrar("painel: o primário antigo fica parado, porque a réplica já foi promovida", "info")
         saidas = []
         if congelados:
             saidas.append(await self.injetar(congelados, "unpause"))
@@ -309,6 +379,23 @@ class Painel:
         if not saidas:
             self.registrar("painel: nada para restaurar", "acao")
         return {"ok": all(s["ok"] for s in saidas), "saida": "\n".join(s["saida"] for s in saidas)}
+
+    def _replica_promovida(self) -> bool:
+        return (self.estado.get("replica") or {}).get("papel") == "primario"
+
+    async def failover(self) -> dict:
+        """Failover manual da origem: o mesmo procedimento do Cenário 2, sem atraso de promoção."""
+        if bloqueio := self._trabalho_bloqueia_falhas():
+            raise web.HTTPConflict(text=bloqueio)
+        if (self.estado.get("replica") or {}).get("papel") != "standby":
+            raise web.HTTPConflict(text="a réplica da origem não está no ar como standby; suba a réplica primeiro")
+        self.registrar("painel: failover da origem (SIGKILL no primário e promoção da réplica)", "acao")
+        try:
+            await amb.failover_origem(0, log=lambda m: self.registrar(m, "acao"))
+        except RuntimeError as e:
+            self.registrar(f"failover falhou: {e}", "erro")
+            return {"ok": False, "saida": str(e)}
+        return {"ok": True}
 
     async def reiniciar_conector(self) -> dict:
         self.registrar("painel: reiniciando conector e tarefas com falha", "acao")
@@ -379,6 +466,36 @@ def _montar_comando(tipo: str, p: dict) -> tuple[list[str], str]:
         if p.get("reiniciar_conector_falho"):
             args.append("--reiniciar-conector-falho")
         return args, f"Cenário 1 ({modo}, janela de {janela}s, {parada} {','.join(brokers)})"
+    if tipo in ("cenario2", "cenario3", "cenario5"):
+        modo = p.get("modo")
+        if modo not in ("domain-events", "cdc", "ambos"):
+            raise web.HTTPBadRequest(text="modo inválido")
+        comuns = ["--modo", modo, "--regime", _num(p, "regime", 30, 0, 86400),
+                  "--recuperacao", _num(p, "recuperacao", 60, 0, 86400), "--taxa", _num(p, "taxa", 100, 1, 5000)]
+        if p.get("reiniciar_conector_falho"):
+            comuns.append("--reiniciar-conector-falho")
+    if tipo == "cenario2":
+        atraso, promo = _num(p, "atraso_replicacao", 5, 0, 3600), _num(p, "atraso_promocao", 5, 0, 3600)
+        return (["scripts.cenario2.promocao_replica", *comuns, "--atraso-replicacao", atraso,
+                 "--atraso-promocao", promo],
+                f"Cenário 2 ({modo}, réplica isolada {atraso}s, promoção após {promo}s)")
+    if tipo == "cenario3":
+        sinal = p.get("sinal", "SIGKILL")
+        if sinal not in ("SIGKILL", "SIGTERM"):
+            raise web.HTTPBadRequest(text="sinal inválido")
+        dur, no_ar = _num(p, "duracao_falha", 600, 10, 86400), _num(p, "tempo_no_ar", 20, 1, 3600)
+        return (["scripts.cenario3.reinicios_repetidos", *comuns, "--duracao-falha", dur, "--tempo-no-ar", no_ar,
+                 "--sinal", sinal], f"Cenário 3 ({modo}, {sinal} por {dur}s, {no_ar}s no ar entre mortes)")
+    if tipo == "cenario5":
+        parada = p.get("parada", "kill")
+        if parada not in ("kill", "stop", "pause"):
+            raise web.HTTPBadRequest(text="tipo de parada inválido")
+        poll, reg = _num(p, "max_poll_interval_ms", 1000, 10, 3_600_000), _num(p, "max_poll_records", 500, 1, 100_000)
+        args = ["scripts.cenario5.queda_consumidor", *comuns, "--max-poll-interval-ms", poll,
+                "--max-poll-records", reg, "--janela", _num(p, "janela", 60, 1, 86400), "--parada", parada]
+        if p.get("calibrar"):
+            return [*args, "--calibrar"], f"Cenário 5: calibração do max.poll.interval ({modo})"
+        return args, f"Cenário 5 ({modo}, {parada} na instância 2, max.poll.interval {poll} ms)"
     raise web.HTTPBadRequest(text="tipo de script inválido")
 
 
@@ -410,6 +527,10 @@ def criar_app(painel: Painel) -> web.Application:
     @rotas.post("/api/restaurar")
     async def restaurar(_):
         return web.json_response(await painel.restaurar_tudo())
+
+    @rotas.post("/api/failover")
+    async def failover(_):
+        return web.json_response(await painel.failover())
 
     @rotas.post("/api/conector/reiniciar")
     async def conector(_):

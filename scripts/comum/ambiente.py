@@ -26,6 +26,11 @@ DESTINO_DSN = os.environ.get("DESTINO_DSN", "postgresql://olist:olist@localhost:
 CONECTOR = os.environ.get("CONNECTOR_NAME", "olist-origem")
 SLOT = os.environ.get("SLOT_NAME", "olist_debezium")
 
+# Cenário 2: réplica física da origem, publicada no host na porta 5434.
+PRIMARIO = "postgres-origem"
+REPLICA = "postgres-origem-replica"
+REPLICA_DSN = os.environ.get("REPLICA_DSN", "postgresql://olist:olist@localhost:5434/olist")
+
 MODOS = {
     "domain-events": {"alvo": "backend-domain-events", "profile": "domain-events",
                       "order": "order-service-domain-events", "consumidor": "shipping-service-domain-events"},
@@ -33,6 +38,21 @@ MODOS = {
             "order": "order-service-cdc", "consumidor": "shipping-service-cdc"},
 }
 BROKERS = ["kafka-1", "kafka-2", "kafka-3"]
+
+# Cenário 5: instâncias consumidoras do mesmo grupo. A 1 é a de sempre; a 2 e a 3 só sobem
+# quando pedidas. Cada uma publica /healthz, /metrics e /group numa porta do host.
+PORTAS_CONSUMIDORES = {1: 8081, 2: 8084, 3: 8085}
+
+
+def consumidor(modo: str, instancia: int) -> str:
+    base = MODOS[modo]["consumidor"]
+    return base if instancia == 1 else f"{base}-{instancia}"
+
+
+def url_consumidor(instancia: int) -> str:
+    if instancia == 1:
+        return CONSUMIDOR_URL
+    return os.environ.get(f"CONSUMIDOR_{instancia}_URL", f"http://localhost:{PORTAS_CONSUMIDORES[instancia]}")
 
 
 def compose(*args: str, check: bool = True, capturar: bool = False, timeout: float | None = None
@@ -51,6 +71,24 @@ async def compose_async(*args: str) -> tuple[int, str]:
     proc = await asyncio.create_subprocess_exec(
         "docker", "compose", "--profile", "domain-events", "--profile", "cdc", *args,
         cwd=RAIZ, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    out, _ = await proc.communicate()
+    return proc.returncode, out.decode(errors="replace")
+
+
+async def ligar_async(*servicos: str) -> tuple[int, str]:
+    """Religa contêineres parados com `docker start`, sem passar pelo Compose.
+
+    `docker compose start` também religa as dependências de inicialização (seed e kafka-init),
+    o que acrescentaria uns 15 s de indisponibilidade a cada religamento do order-service, do
+    consumidor ou do Kafka Connect."""
+    ids = []
+    for s in servicos:
+        rc, out = await compose_async("ps", "-aq", s)
+        if rc != 0 or not out.strip():
+            return 1, f"contêiner de {s} não encontrado"
+        ids += out.split()
+    proc = await asyncio.create_subprocess_exec("docker", "start", *ids, stdout=asyncio.subprocess.PIPE,
+                                                stderr=asyncio.subprocess.STDOUT)
     out, _ = await proc.communicate()
     return proc.returncode, out.decode(errors="replace")
 
@@ -105,6 +143,81 @@ def esperar_conector_running(timeout_s: float) -> None:
             pass
         time.sleep(2)
     raise SystemExit("o conector Debezium não chegou a RUNNING")
+
+
+async def failover_origem(atraso_promocao: float = 0.0, log=print, apos_queda=None, apos_promocao=None) -> dict:
+    """Simula o failover do banco de origem (Cenário 2): encerra o primário sem aviso (SIGKILL),
+    promove a réplica e passa o nome `postgres-origem` para ela, como o endpoint de um banco
+    gerenciado faz ao trocar de nó. Os serviços reconectam ao mesmo nome e chegam à réplica.
+
+    Devolve os instantes de cada passo. Levanta RuntimeError se algum passo falhar."""
+    marcos: dict = {}
+    rc, out = await compose_async("kill", "-s", "SIGKILL", PRIMARIO)
+    marcos["primario_derrubado"] = time.time()
+    if rc != 0:
+        raise RuntimeError(f"não foi possível derrubar o primário: {out}")
+    log(f"primário encerrado (SIGKILL); promovendo a réplica em {atraso_promocao:g}s")
+    if apos_queda is not None:
+        await apos_queda()
+    await asyncio.sleep(atraso_promocao)
+    out = await psql_replica("SELECT pg_promote(true, 60)")
+    marcos["promocao_concluida"] = time.time()
+    if "t" not in out.split():
+        raise RuntimeError(f"a promoção da réplica falhou: {out}")
+    log("réplica promovida a primário")
+    if apos_promocao is not None:
+        await apos_promocao()  # ainda sem tráfego: nada além da réplica alcança o novo primário
+    await apontar_origem_para_replica()
+    marcos["endereco_trocado"] = time.time()
+    log("o nome postgres-origem agora aponta para a réplica promovida")
+    return marcos
+
+
+async def _rede_da_replica() -> tuple[str, str]:
+    """(id do contêiner da réplica, rede do Compose)."""
+    rc, cid = await compose_async("ps", "-q", REPLICA)
+    cid = cid.strip()
+    if rc != 0 or not cid:
+        raise RuntimeError("réplica não encontrada")
+    rc, nome = await compose_async("config", "--format", "json")
+    try:
+        projeto = json.loads(nome)["name"]
+    except Exception:
+        projeto = "olist-tcc"
+    return cid, f"{projeto}_default"
+
+
+async def _docker(*args: str, falha_ok: bool = False) -> str:
+    proc = await asyncio.create_subprocess_exec("docker", *args, stdout=asyncio.subprocess.PIPE,
+                                                stderr=asyncio.subprocess.STDOUT)
+    out, _ = await proc.communicate()
+    if proc.returncode != 0 and not falha_ok:
+        raise RuntimeError(f"docker {' '.join(args)}: {out.decode(errors='replace')}")
+    return out.decode(errors="replace")
+
+
+async def isolar_replica() -> None:
+    """Tira a réplica da rede (partição de rede entre primário e réplica): o que o primário
+    commitar a partir daqui não chega a ela. Congelar o contêiner não serve, porque o kernel
+    continua aceitando o WAL no buffer do socket e a réplica o lê ao descongelar."""
+    cid, rede = await _rede_da_replica()
+    await _docker("network", "disconnect", rede, cid)
+
+
+async def apontar_origem_para_replica() -> None:
+    """Liga a réplica à rede do Compose com o apelido `postgres-origem` (além do próprio nome).
+    O primário antigo precisa estar parado, senão o nome resolveria para os dois."""
+    cid, rede = await _rede_da_replica()
+    await _docker("network", "disconnect", rede, cid, falha_ok=True)
+    await _docker("network", "connect", "--alias", PRIMARIO, "--alias", REPLICA, rede, cid)
+
+
+async def psql_replica(sql: str) -> str:
+    """Executa SQL na réplica por `docker compose exec`, o que funciona mesmo com ela fora da rede."""
+    rc, out = await compose_async("exec", "-T", REPLICA, "psql", "-U", "olist", "-d", "olist", "-AtX", "-c", sql)
+    if rc != 0:
+        raise RuntimeError(f"psql na réplica falhou: {out}")
+    return out
 
 
 async def ler_metricas(sessao: aiohttp.ClientSession, url: str) -> dict[str, float]:

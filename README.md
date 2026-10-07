@@ -3,7 +3,9 @@
 Protótipos do experimento que compara **Domain Events** e **Change Data Capture** como modelos de
 propagação de mudanças entre microsserviços sob falhas de disponibilidade. Este repositório
 usa o **Dataset 1**, o [Brazilian E-Commerce da Olist](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce),
-e traz os scripts de carga e de injeção de falha do **Cenário 1 (fila indisponível)**.
+e traz os scripts de carga e de injeção de falha dos **Cenários 1 (fila indisponível), 2 (promoção de
+réplica), 3 (reinícios repetidos) e 5 (queda de consumidor)**. O Cenário 4 (compensação) ainda falta e
+exige pelo menos três serviços.
 
 | | Software A: Domain Events | Software B: Change Data Capture |
 |---|---|---|
@@ -129,9 +131,19 @@ python -m scripts.painel            # abre em http://localhost:8090
   1 broker, o consumidor, um dos bancos ou o Debezium, com o tipo de parada escolhido; e **Restaurar
   tudo**, que religa o que estiver parado ou congelado. São os mesmos comandos `docker compose` do
   Cenário 1.
-- **Scripts.** Sobe ou troca o backend, gera carga (constante, rajada ou represamento) e executa o
-  Cenário 1 com os parâmetros do formulário, mostrando a saída do script. Enquanto o Cenário 1 ou
-  a troca de backend rodam, os botões de falha ficam desativados para não interferir na execução.
+- **Scripts.** Sobe ou troca o backend, gera carga (constante, rajada ou represamento) e executa os
+  Cenários 1, 2, 3 e 5 (e a calibração do 5) com os parâmetros do formulário, mostrando a saída do
+  script. Enquanto um cenário ou a troca de backend rodam, os botões de falha ficam desativados para
+  não interferir na execução.
+- **Réplica da origem (Cenário 2).** Aparece à esquerda do banco de origem quando existe, como
+  standby (com o atraso de replicação) ou como primário promovido. "Subir a réplica da origem" a
+  cria a partir da origem atual, e "Failover da origem" faz o mesmo failover do script: SIGKILL no
+  primário, promoção e troca do nome `postgres-origem` para a réplica. Depois do failover o painel
+  não religa o primário antigo (seriam dois primários com o mesmo nome); suba o backend de novo.
+- **Grupo de consumo (Cenário 5).** O shipping-service aparece como grupo, com as instâncias 1, 2 e 3
+  e o estado do grupo lido do coordenador (estável, rebalanceando, vazio) com o número de membros.
+  As instâncias 2 e 3 só existem no Cenário 5; "Subir as instâncias 2 e 3" as cria com a
+  configuração padrão.
 - **Gráfico e linha do tempo.** Vazão dos últimos 5 minutos, com faixas onde algum serviço estava
   fora do ar, e o registro de cada mudança de estado e de cada ação feita pelo painel.
 
@@ -230,6 +242,75 @@ export ORIGEM_DISCO_LIMITE=1g
 python -m scripts.cenario1.fila_indisponivel --modo cdc --janelas 15 --taxa 400
 ```
 
+## Cenário 2: promoção de réplica
+
+```bash
+python -m scripts.cenario2.promocao_replica --modo ambos
+python -m scripts.cenario2.promocao_replica --modo cdc --atraso-replicacao 5 --atraso-promocao 5 --regime 30
+```
+
+O RDS é substituído por uma réplica física assíncrona da origem (`postgres-origem-replica`, porta
+5434), criada com `pg_basebackup` depois da reinicialização do ambiente. Cada execução:
+
+1. **regime** com primário e réplica saudáveis;
+2. **falha**: a réplica sai da rede por `--atraso-replicacao` s (o que o primário commitar nesse
+   intervalo não chega a ela), o primário leva SIGKILL e, `--atraso-promocao` s depois, a réplica é
+   promovida e recebe o apelido de rede `postgres-origem`, como o endpoint de um banco gerenciado no
+   failover. O order-service e o Debezium reconectam ao mesmo nome, sem mudança de configuração;
+3. **recuperação** e **estabilização** como no Cenário 1, agora contra a réplica promovida.
+
+Logo depois da promoção, antes de qualquer escrita nova, o script grava `origem_pos_promocao.csv` com
+o que a réplica tem. O `resumo.json` ganha a seção `promocao`: transações confirmadas ao cliente que a
+promoção apagou, quantas delas chegaram ao destino (**eventos órfãos**), pedidos que existem só no
+destino, pedidos com versão maior no destino e pedidos com a mesma versão e conteúdo diferente (a
+origem reusou o número de versão com outra mudança). As transações apagadas saem do oráculo geral de
+perda, porque a origem não as tem mais. No B, também mede quando o slot sumiu e quando reapareceu.
+
+Observado no ensaio na nuvem (amostra sintética, só para validar o pipeline): o Debezium 2.7 não
+para quando o slot some; ele recria o slot no novo primário depois de uns 10 s de nova tentativa e
+segue em `RUNNING`, e as mudanças commitadas nesse intervalo não são propagadas.
+
+## Cenário 3: reinícios repetidos
+
+```bash
+python -m scripts.cenario3.reinicios_repetidos --modo ambos
+python -m scripts.cenario3.reinicios_repetidos --modo cdc --duracao-falha 180 --tempo-no-ar 20
+```
+
+Durante `--duracao-falha` s (padrão 600), o componente de propagação leva SIGKILL, é religado, espera
+ficar pronto (A: `/healthz` do order-service; B: tarefa do Debezium em `RUNNING`), fica no ar por
+`--tempo-no-ar` s e morre de novo. No A o componente é o order-service; no B, o Kafka Connect. No B,
+`--tempo-no-ar` precisa ser menor que `CDC_OFFSET_FLUSH_INTERVAL_MS` (60 s), para a morte vir antes da
+gravação dos offsets. O religamento usa `docker start` direto, porque `docker compose start` rodaria o
+seed e o kafka-init de novo e somaria uns 15 s a cada ciclo.
+
+Saem `ciclos.csv` (morte, religamento e prontidão de cada ciclo) e, no `resumo.json`, as seções
+`reinicios` e `ambiguas`. As requisições que estavam no meio quando o order-service morreu ficam sem
+resposta; a análise decide se cada uma foi commitada pela versão do pedido na origem, que sobe 1 a
+cada commit. Os trechos em que isso não é possível ficam em `sem_decisao` e saem do oráculo.
+
+## Cenário 5: queda de consumidor
+
+```bash
+python -m scripts.cenario5.queda_consumidor --modo ambos --calibrar        # mede o lote cheio
+python -m scripts.cenario5.queda_consumidor --modo ambos --max-poll-interval-ms 3000
+```
+
+O consumidor roda em 3 instâncias do mesmo grupo (portas 8081, 8084 e 8085), com 2 membros cada. O
+kafka-go não tem `max.poll.interval.ms`, então o shipping-service ganhou um modo de leitura em lotes
+que reproduz o cliente Java: busca até `CONSUMER_MAX_POLL_RECORDS` mensagens, processa o lote e só
+então confirma os offsets; se o lote passar de `CONSUMER_MAX_POLL_INTERVAL`, o membro sai do grupo no
+instante em que o limite vence, o que dispara um rebalanceamento, e o lote é reentregue. Com
+`CONSUMER_MAX_POLL_INTERVAL=0` (padrão dos outros cenários) nada muda: uma mensagem por vez, como antes.
+
+`--calibrar` para os consumidores por `--represamento` s sob carga, religa e mede o tempo médio de um
+lote cheio durante a drenagem, sugerindo `--max-poll-interval-ms` 10% acima (grava
+`calibracao.json`). Use um único valor nos dois softwares. Cada execução derruba a instância
+`--instancia-derrubada` (padrão 2) por `--janela` s e a religa. O estado do grupo é lido a cada 0,5 s
+do coordenador (`GET /group` de uma instância que não caiu) e gravado em `grupo.csv`; a seção `grupo`
+do `resumo.json` traz rebalanceamentos, tempo fora de `Stable` e saídas por max.poll.interval por
+fase. A drenagem é o tempo até convergência, e a latência da API por fase sai como nos outros cenários.
+
 ## Decisões de implementação que afetam as medições
 
 Ficam registradas porque entram na descrição dos protótipos (Seção 4.2) e nas ameaças à validade:
@@ -250,8 +331,14 @@ Ficam registradas porque entram na descrição dos protótipos (Seção 4.2) e n
   destino). O pedido só é sobrescrito por versão maior, então duplicatas e atrasadas ficam
   registradas em `received_events` mas não regridem a projeção. `CONSUMER_SESSION_TIMEOUT` (10 s)
   pesa no tempo até a entrega ser retomada, igualmente nos dois modos.
-- **Decomposição.** Por ora são dois serviços (origem e destino), o suficiente para o Cenário 1. O
-  Cenário 4 vai exigir pelo menos três serviços com compensação.
+- **Decomposição.** Por ora são dois serviços (origem e destino), o suficiente para os Cenários 1, 2, 3
+  e 5. O Cenário 4 vai exigir pelo menos três serviços com compensação.
+- **Réplica sem slot físico (Cenário 2).** A réplica faz streaming sem slot de replicação, então o
+  único slot da origem continua sendo o do Debezium, que não existe na réplica (PostgreSQL 16 não
+  sincroniza slots lógicos). O atraso de replicação é provocado tirando a réplica da rede; congelar o
+  contêiner não serve, porque o kernel continua aceitando o WAL no buffer do socket.
+- **Leitura em lotes (Cenário 5).** Desligada por padrão; só o Cenário 5 a liga. O lote é o que já
+  está no buffer do leitor do kafka-go, até `CONSUMER_MAX_POLL_RECORDS`.
 
 ## Estrutura
 
@@ -261,10 +348,15 @@ cmd/shipping-service   consumidor (destino)
 cmd/seed               carga inicial a partir dos CSVs
 internal/              modelo, publicação no Kafka, métricas, configuração
 db/origem, db/destino  esquemas SQL
+db/replica             inicialização da réplica da origem (Cenário 2)
 infra/kafka            criação dos tópicos
 infra/debezium         configuração e registro do conector
 scripts/carga          gerador de carga e testes de carga
 scripts/cenario1       injeção de falha do Cenário 1
+scripts/cenario2       promoção de réplica
+scripts/cenario3       reinícios repetidos do componente de propagação
+scripts/cenario5       queda de consumidor e rebalanceamento
+scripts/comum/execucao.py  fases comuns dos cenários 2, 3 e 5
 scripts/comum          dataset, controle do ambiente, coleta e análise
 scripts/painel         painel web com o diagrama, as falhas e os scripts
 scripts/dados          amostra sintética
