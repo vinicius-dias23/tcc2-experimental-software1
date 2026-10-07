@@ -24,6 +24,17 @@ class Coletor:
         self._id_inicial = 0
         self.origem: psycopg.AsyncConnection | None = None
         self.destino: psycopg.AsyncConnection | None = None
+        self.dsn = {"origem": ORIGEM_DSN, "destino": DESTINO_DSN}
+
+    async def trocar_origem(self, dsn: str) -> None:
+        """Passa a ler a origem em outro endereço (Cenário 2: réplica promovida a primário)."""
+        if self.origem is not None and not self.origem.closed:
+            try:
+                await self.origem.close()
+            except Exception:
+                pass
+        self.origem = None
+        self.dsn["origem"] = dsn
 
     async def conectar(self) -> None:
         self.destino = await psycopg.AsyncConnection.connect(DESTINO_DSN, autocommit=True)
@@ -38,8 +49,7 @@ class Coletor:
         if conn is not None and not conn.closed:
             return conn
         try:
-            conn = await psycopg.AsyncConnection.connect(ORIGEM_DSN if qual == "origem" else DESTINO_DSN,
-                                                         autocommit=True, connect_timeout=3)
+            conn = await psycopg.AsyncConnection.connect(self.dsn[qual], autocommit=True, connect_timeout=3)
         except psycopg.Error:
             conn = None
         setattr(self, qual, conn)
