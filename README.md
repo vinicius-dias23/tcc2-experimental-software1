@@ -109,6 +109,36 @@ curl -s localhost:8081/metrics
 Portas no host: API `8080`, consumidor `8081`, Kafka Connect `8083` (só no B), banco de origem `5432`
 e banco de destino `5433` (usuário, senha e base: `olist`).
 
+## Painel
+
+Uma página no navegador com o diagrama dos serviços, o estado de cada um ao vivo, a vazão entre
+eles e botões para injetar falhas e disparar os scripts. Roda na máquina, com o venv ativo, fora
+do Docker Compose (assim sobrevive ao `down -v` que os scripts fazem entre execuções):
+
+```bash
+python -m scripts.painel            # abre em http://localhost:8090
+```
+
+- **Diagrama.** Mostra o software que estiver no ar (A ou B), com cada contêiner em verde (no ar),
+  âmbar (iniciando, não saudável ou sem responder ao `/healthz`), roxo (congelado com `pause`),
+  vermelho (parado) ou cinza (não criado). As setas mostram a vazão lida dos `/metrics`, as falhas de
+  publicação no A e, no B, o estado da tarefa do Debezium e o atraso do slot de replicação. Clicar
+  num serviço abre os detalhes e os botões **Parar** (`stop`), **Matar** (`kill`), **Congelar**
+  (`pause`), **Religar** e **Reiniciar**.
+- **Injeção rápida.** Atalhos para derrubar a fila inteira, tirar o quórum (2 brokers), derrubar
+  1 broker, o consumidor, um dos bancos ou o Debezium, com o tipo de parada escolhido; e **Restaurar
+  tudo**, que religa o que estiver parado ou congelado. São os mesmos comandos `docker compose` do
+  Cenário 1.
+- **Scripts.** Sobe ou troca o backend, gera carga (constante, rajada ou represamento) e executa o
+  Cenário 1 com os parâmetros do formulário, mostrando a saída do script. Enquanto o Cenário 1 ou
+  a troca de backend rodam, os botões de falha ficam desativados para não interferir na execução.
+- **Gráfico e linha do tempo.** Vazão dos últimos 5 minutos, com faixas onde algum serviço estava
+  fora do ar, e o registro de cada mudança de estado e de cada ação feita pelo painel.
+
+O painel só escuta em `127.0.0.1`, porque controla o Docker. As falhas manuais servem para explorar
+o comportamento; as medições do TCC continuam saindo dos scripts, que registram tudo em
+`resultados/`.
+
 ## Testes de carga
 
 Rodam contra o backend que estiver no ar (o modo é detectado sozinho):
@@ -236,5 +266,6 @@ infra/debezium         configuração e registro do conector
 scripts/carga          gerador de carga e testes de carga
 scripts/cenario1       injeção de falha do Cenário 1
 scripts/comum          dataset, controle do ambiente, coleta e análise
+scripts/painel         painel web com o diagrama, as falhas e os scripts
 scripts/dados          amostra sintética
 ```
