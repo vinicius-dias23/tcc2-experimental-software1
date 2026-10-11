@@ -108,7 +108,7 @@ curl -s -X PATCH localhost:8080/orders/<order_id>/status -H 'Content-Type: appli
 curl -s localhost:8081/metrics
 ```
 
-Portas no host: API `8080`, consumidor `8081`, Kafka Connect `8083` (só no B), banco de origem `5432`
+Portas no host: API `8080`, consumidor `8081`, Kafka Connect `8083` e vigia do conector `8086` (só no B), banco de origem `5432`
 e banco de destino `5433` (usuário, senha e base: `olist`).
 
 ## Painel
@@ -194,15 +194,17 @@ Cada execução:
 
 Opções de injeção: `--parada kill` (SIGKILL), `--parada pause` (processo congelado e inalcançável) e
 `--brokers kafka-2,kafka-3` (derruba só parte do cluster, deixando as partições sem quórum para
-`acks=all`). No B, `--reiniciar-conector-falho` reinicia a tarefa do Debezium se ela terminar em
-`FAILED` e registra a intervenção.
+`acks=all`). No B, `--reiniciar-conector-falho` faz a intervenção manual: reinicia a tarefa do
+Debezium que ficou em `FAILED` depois que o reinício automático desistiu, e registra a intervenção.
+`--sem-recuperacao` desliga a recuperação automática dos dois softwares (ver abaixo); vale para todos
+os cenários.
 
 ### O que sai em `resultados/cenario1/<execução>/`
 
 | Arquivo | Conteúdo |
 |---|---|
 | `ledger.csv` | uma linha por requisição: horário, operação, `correlation_id`, status HTTP, latência |
-| `serie_temporal.csv` | amostra a cada `--intervalo` s: sucesso e p99 da API, escritas commitadas, mensagens entregues, lacuna de propagação, divergência entre as bases, falhas de publicação (A), estado do conector (B), tamanho do banco, WAL e WAL retido pelo slot |
+| `serie_temporal.csv` | amostra a cada `--intervalo` s: sucesso e p99 da API, escritas commitadas, mensagens entregues, lacuna de propagação, divergência entre as bases, falhas de publicação, eventos esperando retentativa, recuperados e declarados perdidos (A), estado do conector e reinícios automáticos (B), tamanho do banco, WAL e WAL retido pelo slot |
 | `marcos.json` | instantes de início e fim de cada fase |
 | `origem_*.csv`, `destino_*.csv` | exportação das bases ao final, para refazer a análise offline |
 | `logs/` | logs dos serviços, brokers e Kafka Connect |
@@ -229,6 +231,36 @@ Opções de injeção: `--parada kill` (SIGKILL), `--parada pause` (processo con
 - **Tempo até convergência**: da volta dos brokers até a primeira amostra com divergência zero.
 - **Efeito colateral**: latência p99 e taxa de sucesso da API por fase; tamanho do banco, do WAL e
   do WAL retido pelo slot por fase.
+- **Recuperação** (seção `recuperacao`, em todos os cenários): no A, eventos publicados por uma
+  retentativa, eventos declarados perdidos e a **perda não declarada** (perda medida pelo oráculo
+  menos os declarados perdidos: o que sumiu sem nenhum contador registrar, como a fila de
+  retentativa de um processo morto), além dos confirmados com atraso pelo broker; no B, reinícios
+  automáticos, se o vigia desistiu e quando.
+
+## Recuperação automática
+
+Os dois softwares tentam se recuperar sozinhos com **a mesma política**: 3 tentativas, a primeira
+1 s depois da falha e cada uma o dobro da anterior (1 s, 2 s, 4 s). Esgotadas as tentativas, a falha
+é declarada e contada.
+
+| | Software A: retentativa da publicação | Software B: reinício da tarefa do Debezium |
+|---|---|---|
+| Quando age | a publicação síncrona falhou depois do commit | o conector ou a tarefa entrou em `FAILED` |
+| O que faz | espera o resultado real da publicação; se o broker recusou, reenvia o evento a cada tentativa | pede `POST /connectors/<nome>/restart?includeTasks=true&onlyFailed=true` |
+| Esgotado | o evento é **declarado perdido** (`events_declared_lost_total`) | o vigia **desiste** (`connector_restart_gave_up=1`): intervenção manual necessária |
+| Onde fica | memória do `order-service` (até `PUBLISH_RETRY_BUFFER` eventos; acima disso, declarado perdido) | serviço `connect-watchdog`, papel que em produção é do operador do Connect (ex.: `autoRestart` do Strimzi) |
+| Variáveis | `PUBLISH_RETRY_ATTEMPTS`, `PUBLISH_RETRY_BACKOFF`, `PUBLISH_RETRY_MULTIPLIER`, `PUBLISH_RETRY_BUFFER` | `CONNECT_RESTART_ATTEMPTS`, `CONNECT_RESTART_BACKOFF`, `CONNECT_RESTART_MULTIPLIER`, `CONNECT_RESTART_RESET_AFTER` |
+
+A fila de retentativa do A é **só em memória**, de propósito: um registro durável do que falta
+publicar seria um Outbox, que o Software A não usa. Se o processo morrer (Cenário 3), os eventos que
+esperavam retentativa se perdem sem ser contados, e aparecem como perda não declarada. O vigia do B
+não religa o Kafka Connect quando o processo cai; só reinicia a tarefa em `FAILED` com o Connect no
+ar. O contador de tentativas do vigia volta a zero depois de `CONNECT_RESTART_RESET_AFTER` (60 s) em
+`RUNNING`.
+
+Os valores usados em cada execução ficam em `marcos.json` (`parametros.recuperacao_automatica`).
+`--sem-recuperacao` nos scripts (ou `PUBLISH_RETRY_ATTEMPTS=0` e `CONNECT_RESTART_ATTEMPTS=0`) volta
+ao comportamento sem retentativa, para comparar.
 
 ### Disco limitado no banco de origem
 
@@ -317,14 +349,22 @@ Ficam registradas porque entram na descrição dos protótipos (Seção 4.2) e n
 
 - **Publicação síncrona no A.** O `order-service` publica dentro da requisição, depois do commit, e
   espera a confirmação do broker (`acks=all`) por até `PUBLISH_TIMEOUT` (padrão 5 s), com as
-  retentativas do produtor em memória. Esgotado o tempo, o evento é dado como perdido e a API responde
-  **sucesso** mesmo assim, porque a mudança já está commitada (`PUBLISH_FAILURE_RESPONSE=error` troca
-  por 503). Consequência medida no ensaio: durante a falha a latência da API sobe para o valor do
-  timeout, e parte das publicações dadas como falhas ainda chega depois, pela retentativa.
+  retentativas do produtor em memória. Esgotado o tempo, o evento vai para a fila de retentativa
+  (ver "Recuperação automática") e a API responde **sucesso** mesmo assim, porque a mudança já está
+  commitada (`PUBLISH_FAILURE_RESPONSE=error` troca por 503). Consequência medida no ensaio: durante a
+  falha a latência da API sobe para o valor do timeout.
+- **Falha de publicação no A é o resultado real do produtor.** Cancelar a espera não tira a mensagem
+  da fila interna do kafka-go, que continua tentando. Por isso a requisição desiste depois de
+  `PUBLISH_TIMEOUT`, mas a fila de retentativa espera o resultado real: se o broker confirmar depois,
+  o evento conta como confirmado com atraso e não é reenviado; só uma recusa de fato gera retentativa.
+  Reenviar no timeout duplicaria quase todos os eventos da janela. Ainda assim o kafka-go não tem
+  produtor idempotente, então alguma duplicação continua possível. Os eventos recuperados chegam
+  depois de eventos mais novos do mesmo pedido, o que aparece como violação de ordem (a guarda de
+  versão do consumidor impede que a projeção regrida).
 - **Produtor do Kafka Connect no B.** `producer.delivery.timeout.ms` está no máximo, para a tarefa do
   Debezium esperar a fila voltar em vez de falhar. Com o padrão do Kafka (2 min), a tarefa vai para
-  `FAILED` em janelas longas e exige reinício manual (`CDC_PRODUCER_DELIVERY_TIMEOUT_MS=120000` e
-  `--reiniciar-conector-falho` reproduzem esse caso).
+  `FAILED` em janelas longas e passa a depender do reinício automático (`CDC_PRODUCER_DELIVERY_TIMEOUT_MS=120000`
+  reproduz esse caso).
 - **Snapshot no B.** O conector usa `snapshot.mode=no_data` e é registrado depois da carga inicial:
   só as mudanças feitas pela API são propagadas, como no A.
 - **Consumidor.** Entrega pelo menos uma vez (offset gravado a cada 1 s, depois da gravação no
@@ -346,7 +386,8 @@ Ficam registradas porque entram na descrição dos protótipos (Seção 4.2) e n
 cmd/order-service      serviço de negócio (origem)
 cmd/shipping-service   consumidor (destino)
 cmd/seed               carga inicial a partir dos CSVs
-internal/              modelo, publicação no Kafka, métricas, configuração
+cmd/connect-watchdog   reinício automático da tarefa do Debezium (Software B)
+internal/              modelo, publicação e retentativa no Kafka, política de retentativa, métricas, configuração
 db/origem, db/destino  esquemas SQL
 db/replica             inicialização da réplica da origem (Cenário 2)
 infra/kafka            criação dos tópicos

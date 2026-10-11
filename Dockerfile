@@ -1,4 +1,4 @@
-# Imagem única com os três binários Go (order-service, shipping-service e seed).
+# Imagem única com os binários Go (order-service, shipping-service, seed e connect-watchdog).
 # O modo de propagação é escolhido em tempo de execução por PROPAGATION_MODE,
 # de modo que os dois protótipos rodam exatamente o mesmo código compilado.
 FROM golang:1.23-alpine AS build
@@ -13,5 +13,5 @@ FROM alpine:3.20
 # O wget do busybox (já presente) atende aos healthchecks.
 COPY --from=build /out/ /app/
 ENV TZ=UTC
-EXPOSE 8080 8081
+EXPOSE 8080 8081 8086
 CMD ["/app/order-service"]

@@ -168,6 +168,12 @@ services:
       PUBLISH_TIMEOUT: ${PUBLISH_TIMEOUT:-5s}
       PUBLISH_MAX_ATTEMPTS: ${PUBLISH_MAX_ATTEMPTS:-10}
       PUBLISH_FAILURE_RESPONSE: ${PUBLISH_FAILURE_RESPONSE:-success}
+      # Retentativa em memória do evento que falhou na publicação síncrona (M1): tentativas,
+      # espera antes da primeira e multiplicador das seguintes. 0 tentativas desliga.
+      PUBLISH_RETRY_ATTEMPTS: ${PUBLISH_RETRY_ATTEMPTS:-3}
+      PUBLISH_RETRY_BACKOFF: ${PUBLISH_RETRY_BACKOFF:-1s}
+      PUBLISH_RETRY_MULTIPLIER: ${PUBLISH_RETRY_MULTIPLIER:-2}
+      PUBLISH_RETRY_BUFFER: ${PUBLISH_RETRY_BUFFER:-10000}
 
   shipping-service-domain-events:
     <<: *shipping-service
@@ -240,6 +246,26 @@ services:
       kafka-connect: { condition: service_healthy }
       seed: { condition: service_completed_successfully }
 
+  # Reinício automático da tarefa do Debezium em FAILED (M4), com a mesma política de
+  # retentativa do Software A. 0 tentativas desliga (o vigia só registra a falha).
+  connect-watchdog:
+    <<: *app
+    profiles: ["cdc"]
+    command: ["/app/connect-watchdog"]
+    ports: ["8086:8086"]
+    environment:
+      CONNECT_RESTART_ATTEMPTS: ${CONNECT_RESTART_ATTEMPTS:-3}
+      CONNECT_RESTART_BACKOFF: ${CONNECT_RESTART_BACKOFF:-1s}
+      CONNECT_RESTART_MULTIPLIER: ${CONNECT_RESTART_MULTIPLIER:-2}
+      CONNECT_RESTART_RESET_AFTER: ${CONNECT_RESTART_RESET_AFTER:-60s}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8086/healthz >/dev/null"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      debezium-connector-init: { condition: service_completed_successfully }
+
   order-service-cdc:
     <<: *order-service
     profiles: ["cdc"]
@@ -279,3 +305,4 @@ services:
       order-service-cdc: { condition: service_healthy }
       shipping-service-cdc: { condition: service_healthy }
       debezium-connector-init: { condition: service_completed_successfully }
+      connect-watchdog: { condition: service_healthy }
