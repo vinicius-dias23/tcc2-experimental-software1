@@ -1,6 +1,8 @@
 // order-service é o serviço de negócio (origem). Recebe as operações sobre pedidos,
 // persiste no banco de origem e, apenas no modo domain-events (Software A), publica o
-// evento de domínio diretamente na fila logo após o commit.
+// evento de domínio diretamente na fila logo após o commit. Se essa publicação falhar, o
+// evento vai para uma fila de retentativa em memória e, esgotadas as tentativas, é
+// declarado perdido.
 //
 // No modo cdc (Software B) o código é o mesmo, mas a publicação é desligada: quem
 // propaga é o Debezium, lendo o WAL do banco de origem.
@@ -28,6 +30,7 @@ import (
 	"github.com/vinicius-dias23/tcc2-experimental-software1/internal/metrics"
 	"github.com/vinicius-dias23/tcc2-experimental-software1/internal/model"
 	"github.com/vinicius-dias23/tcc2-experimental-software1/internal/pg"
+	"github.com/vinicius-dias23/tcc2-experimental-software1/internal/retry"
 )
 
 const orderColumns = `order_id, customer_id, order_status, order_purchase_timestamp, order_approved_at,
@@ -38,10 +41,17 @@ type server struct {
 	mode string
 	db   *pgxpool.Pool
 	pub  events.Publisher
+	// Retentativa em memória dos eventos cuja publicação síncrona falhou (Software A).
+	retry *events.RetryQueue
+	// Contexto do processo: as retentativas não dependem da requisição que as originou.
+	ctx context.Context
 	// Resposta ao cliente quando a publicação falha depois do commit:
 	// "success" (padrão) responde 2xx, pois a mudança está commitada;
 	// "error" responde 503, embora o commit já tenha ocorrido.
 	failureResponse string
+	// Tempo máximo que a requisição espera a confirmação do broker; esgotado, a publicação
+	// é dada como falha na resposta e o resultado real fica com a fila de retentativa.
+	publishTimeout time.Duration
 	// Tempo máximo das operações no banco por requisição; esgotado, a API responde 503.
 	dbTimeout time.Duration
 
@@ -64,13 +74,14 @@ func main() {
 	s := &server{
 		mode:             mode,
 		db:               db,
+		ctx:              ctx,
 		failureResponse:  config.String("PUBLISH_FAILURE_RESPONSE", "success"),
 		dbTimeout:        config.Duration("DB_TIMEOUT", 10*time.Second),
 		created:          reg.Counter("orders_created_total", "pedidos criados (commit concluído)"),
 		statusChanged:    reg.Counter("order_status_changes_total", "transições de status commitadas"),
 		httpErrors:       reg.Counter("http_errors_total", "requisições respondidas com erro"),
 		published:        reg.Counter("events_published_total", "eventos de domínio confirmados pelo broker"),
-		publishFailed:    reg.Counter("events_publish_failed_total", "eventos de domínio cuja publicação falhou após o commit"),
+		publishFailed:    reg.Counter("events_publish_failed_total", "eventos de domínio cuja publicação síncrona falhou após o commit (vão para a retentativa)"),
 		publishLatencyMs: reg.Counter("events_publish_latency_ms_sum", "soma da latência de publicação (ms)"),
 	}
 
@@ -79,9 +90,12 @@ func main() {
 			Brokers:     config.List("KAFKA_BROKERS", "kafka-1:9092,kafka-2:9092,kafka-3:9092"),
 			Topic:       config.String("DOMAIN_EVENTS_TOPIC", "olist.domain-events.orders"),
 			MaxAttempts: config.Int("PUBLISH_MAX_ATTEMPTS", 10),
-			Timeout:     config.Duration("PUBLISH_TIMEOUT", 5*time.Second),
 		})
 		s.pub = p
+		s.publishTimeout = config.Duration("PUBLISH_TIMEOUT", 5*time.Second)
+		s.retry = events.NewRetryQueue(p, retry.FromEnv("PUBLISH_RETRY"),
+			config.Int("PUBLISH_RETRY_BUFFER", 10000), reg)
+		go s.retry.LogSummary(ctx)
 		go s.logPublishFailures(ctx)
 	} else {
 		s.pub = events.NoopPublisher{}
@@ -267,7 +281,8 @@ func (s *server) getOrder(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, o)
 }
 
-// publish envia o evento no modo domain-events e devolve se ele foi confirmado.
+// publish envia o evento no modo domain-events e devolve se ele foi confirmado na
+// publicação síncrona; se não foi, o evento segue para a fila de retentativa.
 // No modo cdc não faz nada e devolve true.
 func (s *server) publish(ctx context.Context, ev model.DomainEvent) bool {
 	if s.mode != config.ModeDomainEvents {
@@ -282,10 +297,22 @@ func (s *server) publish(ctx context.Context, ev model.DomainEvent) bool {
 		return false
 	}
 	start := time.Now()
-	// A publicação não é cancelada se o cliente desistir da requisição.
-	err = s.pub.Publish(context.WithoutCancel(ctx), ev.AggregateID, payload, map[string]string{
-		"correlation_id": ev.CorrelationID, "event_type": ev.EventType,
-	})
+	headers := map[string]string{"correlation_id": ev.CorrelationID, "event_type": ev.EventType}
+	// A publicação não é cancelada se o cliente desistir, nem quando a requisição para de
+	// esperar: o kafka-go continua tentando, e o resultado real vai para a retentativa.
+	result := make(chan error, 1)
+	go func() { result <- s.pub.Publish(s.ctx, ev.AggregateID, payload, headers) }()
+	timer := time.NewTimer(s.publishTimeout)
+	defer timer.Stop()
+	select {
+	case err = <-result:
+		if err != nil {
+			s.retry.Enqueue(s.ctx, ev.AggregateID, payload, headers, nil)
+		}
+	case <-timer.C:
+		err = errors.New("tempo de publicação esgotado")
+		s.retry.Enqueue(s.ctx, ev.AggregateID, payload, headers, result)
+	}
 	s.publishLatencyMs.Add(time.Since(start).Milliseconds())
 	if err != nil {
 		s.publishFailed.Add(1)
@@ -315,7 +342,7 @@ func (s *server) logPublishFailures(ctx context.Context) {
 			return
 		case <-t.C:
 			if n := s.failuresSinceLog.Swap(0); n > 0 {
-				log.Printf("ERRO: %d eventos não publicados nos últimos 5s (total %d)", n, s.publishFailed.Load())
+				log.Printf("ERRO: %d eventos falharam na publicação síncrona nos últimos 5s e foram para a retentativa (total %d)", n, s.publishFailed.Load())
 			}
 		}
 	}

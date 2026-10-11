@@ -34,6 +34,18 @@ func Int(key string, def int) int {
 	return n
 }
 
+func Float(key string, def float64) float64 {
+	v := String(key, "")
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		log.Fatalf("variável %s inválida (%q): %v", key, v, err)
+	}
+	return f
+}
+
 func Duration(key string, def time.Duration) time.Duration {
 	v := String(key, "")
 	if v == "" {

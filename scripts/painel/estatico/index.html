@@ -134,8 +134,9 @@
           <label><input type="checkbox" name="brokers" value="kafka-2" checked> kafka-2</label>
           <label><input type="checkbox" name="brokers" value="kafka-3" checked> kafka-3</label>
         </fieldset>
-        <label class="check"><input type="checkbox" name="reiniciar_conector_falho"> reiniciar o conector se falhar (CDC)</label>
+        <label class="check"><input type="checkbox" name="reiniciar_conector_falho"> intervenção manual no conector se o reinício automático desistir (CDC)</label>
         <p class="dica">Reinicializa o ambiente antes (down -v). Os resultados vão para resultados/cenario1/.</p>
+        <label class="check"><input type="checkbox" name="sem_recuperacao"> sem recuperação automática (retentativa no A, reinício do conector no B)</label>
         <button type="submit" class="primario">Executar Cenário 1</button>
       </form>
     </details>
@@ -154,8 +155,9 @@
         <label>Regime antes (s) <input name="regime" type="number" value="30" min="0"></label>
         <label>Recuperação (s) <input name="recuperacao" type="number" value="60" min="0"></label>
         <label>Taxa (ops/s) <input name="taxa" type="number" value="100" min="1"></label>
-        <label class="check"><input type="checkbox" name="reiniciar_conector_falho"> reiniciar o conector se falhar (CDC)</label>
+        <label class="check"><input type="checkbox" name="reiniciar_conector_falho"> intervenção manual no conector se o reinício automático desistir (CDC)</label>
         <p class="dica">Sobe a réplica, tira-a da rede pelo tempo indicado (o que o primário commitar nesse intervalo não chega a ela), derruba o primário com SIGKILL e promove a réplica, que assume o nome postgres-origem. Resultados em resultados/cenario2/.</p>
+        <label class="check"><input type="checkbox" name="sem_recuperacao"> sem recuperação automática (retentativa no A, reinício do conector no B)</label>
         <button type="submit" class="primario">Executar Cenário 2</button>
       </form>
     </details>
@@ -178,6 +180,7 @@
         <label>Recuperação (s) <input name="recuperacao" type="number" value="60" min="0"></label>
         <label>Taxa (ops/s) <input name="taxa" type="number" value="100" min="1"></label>
         <p class="dica">Mata e religa o componente de propagação em ciclos: o order-service no A, o Kafka Connect no B. No B, o tempo no ar precisa ser menor que o intervalo de gravação de offsets (60 s). Resultados em resultados/cenario3/.</p>
+        <label class="check"><input type="checkbox" name="sem_recuperacao"> sem recuperação automática (retentativa no A, reinício do conector no B)</label>
         <button type="submit" class="primario">Executar Cenário 3</button>
       </form>
     </details>
@@ -202,6 +205,7 @@
         <label>Taxa (ops/s) <input name="taxa" type="number" value="300" min="1"></label>
         <p class="dica">Três instâncias do consumidor, com dois membros do grupo cada, lendo em lotes. Calibre antes: a calibração represa a fila e mede quanto tempo leva um lote cheio em cada software. Resultados em resultados/cenario5/.</p>
         <div class="botoes">
+          <label class="check"><input type="checkbox" name="sem_recuperacao"> sem recuperação automática (retentativa no A, reinício do conector no B)</label>
           <button type="submit" class="primario">Executar Cenário 5</button>
           <button type="submit" data-calibrar="1">Calibrar o max.poll.interval</button>
         </div>

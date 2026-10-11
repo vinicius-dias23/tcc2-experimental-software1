@@ -26,20 +26,14 @@ type KafkaPublisherConfig struct {
 	Brokers     []string
 	Topic       string
 	MaxAttempts int
-	// Timeout é o tempo máximo que a requisição de negócio espera pela confirmação
-	// do broker. Esgotado esse tempo, a publicação é dada como falha e o evento se
-	// perde: não há registro durável de que ele deveria existir (sem Outbox).
-	Timeout time.Duration
 }
 
 type KafkaPublisher struct {
-	w       *kafka.Writer
-	timeout time.Duration
+	w *kafka.Writer
 }
 
 func NewKafkaPublisher(cfg KafkaPublisherConfig) *KafkaPublisher {
 	return &KafkaPublisher{
-		timeout: cfg.Timeout,
 		w: &kafka.Writer{
 			Addr:     kafka.TCP(cfg.Brokers...),
 			Topic:    cfg.Topic,
@@ -57,11 +51,11 @@ func NewKafkaPublisher(cfg KafkaPublisherConfig) *KafkaPublisher {
 	}
 }
 
-// Publish é síncrono: bloqueia o caminho da requisição até o broker confirmar
-// ou até o timeout configurado.
+// Publish bloqueia até o broker confirmar ou até o kafka-go esgotar as próprias tentativas
+// (MaxAttempts). Cancelar ctx não retira a mensagem da fila interna do kafka-go: ela ainda
+// pode ser gravada depois. Por isso quem precisa de um prazo (a requisição de negócio)
+// espera o resultado com timeout, mas a decisão de retentar usa o resultado real.
 func (p *KafkaPublisher) Publish(ctx context.Context, key string, value []byte, headers map[string]string) error {
-	ctx, cancel := context.WithTimeout(ctx, p.timeout)
-	defer cancel()
 	msg := kafka.Message{Key: []byte(key), Value: value}
 	for k, v := range headers {
 		msg.Headers = append(msg.Headers, kafka.Header{Key: k, Value: []byte(v)})

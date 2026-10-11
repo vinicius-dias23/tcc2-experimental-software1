@@ -50,7 +50,9 @@ CAMPOS_SERIE = ["t", "instante", "fase", "api_enviadas", "api_sucesso", "api_err
                 "api_p99_ms", "em_voo", "commitadas_total", "destino_mensagens_total", "destino_correlacoes",
                 "gap", "divergencia", "publicacao_ok_total", "publicacao_falhas_total", "conector_estado",
                 "origem_disponivel", "origem_db_bytes", "origem_wal_bytes", "origem_pedidos_tocados",
-                "slot_ativo", "slot_retido_bytes", "slot_atraso_bytes"]
+                "slot_ativo", "slot_retido_bytes", "slot_atraso_bytes",
+                "retentativa_pendentes", "confirmados_com_atraso_total", "retentativa_recuperados_total", "declarados_perdidos_total",
+                "conector_reinicios_auto_total", "conector_vigia_desistiu"]
 
 
 class Execucao:
@@ -61,7 +63,8 @@ class Execucao:
         self.marcos: dict = {"modo": modo, "parametros": {
             "janela_s": janela_s, "taxa_ops_s": args.taxa, "regime_s": args.regime,
             "recuperacao_carga_s": args.recuperacao, "brokers": args.brokers, "parada": args.parada,
-            "intervalo_amostra_s": args.intervalo, "reiniciar_conector_falho": args.reiniciar_conector_falho}}
+            "intervalo_amostra_s": args.intervalo, "reiniciar_conector_falho": args.reiniciar_conector_falho,
+            "recuperacao_automatica": amb.parametros_recuperacao()}}
 
     async def rodar(self, pedidos) -> dict:
         a = self.args
@@ -134,9 +137,15 @@ class Execucao:
                 self._log(f"sem mensagens novas há {a.sem_progresso:.0f}s; encerrando com divergência "
                           f"(gap={u.get('gap')}, divergência={u.get('divergencia')})")
                 return
-            if self.modo == "cdc" and a.reiniciar_conector_falho and u.get("conector_estado") == "FAILED":
+            if self._precisa_intervir(u):
                 await self._intervir()
         self._log("limite de estabilização atingido")
+
+    def _precisa_intervir(self, linha: dict) -> bool:
+        """Intervenção manual (--reiniciar-conector-falho): só quando a tarefa está em FAILED e o
+        reinício automático já desistiu (ou está desligado)."""
+        return (self.modo == "cdc" and self.args.reiniciar_conector_falho and linha.get("conector_estado") == "FAILED"
+                and str(linha.get("conector_vigia_desistiu", "")) in ("1", "1.0"))
 
     async def _intervir(self) -> None:
         if "intervencao_conector" not in self.marcos:
@@ -161,8 +170,7 @@ class Execucao:
                               f"{self._mb('slot', linha['slot_retido_bytes']) if self.modo == 'cdc' else ''}"
                               f"{'' if linha['origem_disponivel'] else 'ORIGEM FORA DO AR '}"
                               f"{'conector=' + linha['conector_estado'] if self.modo == 'cdc' else 'falhas_pub=' + str(linha['publicacao_falhas_total'])}")
-                    if self.modo == "cdc" and self.args.reiniciar_conector_falho and \
-                            self.fase == "recuperacao" and linha["conector_estado"] == "FAILED":
+                    if self.fase == "recuperacao" and self._precisa_intervir(linha):
                         await self._intervir()
                 except Exception as e:
                     self._log(f"erro na amostragem: {type(e).__name__}: {e}")
@@ -188,7 +196,15 @@ class Execucao:
             "publicacao_ok_total": met.get("events_published_total", ""),
             "publicacao_falhas_total": met.get("events_publish_failed_total", ""),
             "conector_estado": await amb.estado_conector(self.sessao) if self.modo == "cdc" else "",
+            "retentativa_pendentes": met.get("events_retry_pending", ""),
+            "confirmados_com_atraso_total": met.get("events_late_confirmed_total", ""),
+            "retentativa_recuperados_total": met.get("events_retry_recovered_total", ""),
+            "declarados_perdidos_total": met.get("events_declared_lost_total", ""),
         }
+        if self.modo == "cdc":
+            vigia = await amb.ler_metricas(self.sessao, amb.VIGIA_URL)
+            linha["conector_reinicios_auto_total"] = vigia.get("connector_auto_restarts_total", "")
+            linha["conector_vigia_desistiu"] = vigia.get("connector_restart_gave_up", "")
         linha.update({k: bd[k] for k in ("origem_disponivel", "origem_db_bytes", "origem_wal_bytes", "origem_pedidos_tocados",
                                           "slot_ativo", "slot_retido_bytes", "slot_atraso_bytes")})
         return linha
@@ -202,7 +218,7 @@ class Execucao:
         logs.mkdir(exist_ok=True)
         servicos = [amb.MODOS[self.modo]["order"], amb.MODOS[self.modo]["consumidor"], *amb.BROKERS]
         if self.modo == "cdc":
-            servicos.append("kafka-connect")
+            servicos += ["kafka-connect", "connect-watchdog"]
         for s in servicos:
             r = amb.compose("logs", "--no-color", "--timestamps", s, check=False, capturar=True, timeout=120)
             (logs / f"{s}.log").write_text(r.stdout + r.stderr)
@@ -227,12 +243,14 @@ def fracao_seed() -> float:
 CAMPOS_CONSOLIDADO = ["execucao", "modo", "janela_s", "repeticao", "commitadas", "perda_eventos", "perda_pct",
                       "perda_mensagens", "duplicacao", "violacao_ordem", "div_ausentes", "div_versao",
                       "api_sucesso_falha", "api_p99_falha_ms", "api_p99_regime_ms", "retomada_emissao_s",
-                      "retomada_entrega_s", "convergencia_s", "wal_max_falha_mb", "slot_max_falha_mb"]
+                      "retomada_entrega_s", "convergencia_s", "wal_max_falha_mb", "slot_max_falha_mb",
+                      "recuperados_retentativa", "declarados_perdidos", "reinicios_auto_conector"]
 
 
 def consolidar(arquivo: Path, r: dict, rep: int) -> None:
     novo = not arquivo.exists()
     i, t, api, col = r["integridade"], r["tempos"], r["api"], r["efeito_colateral"]
+    rec = r.get("recuperacao", {})
     mb = lambda v: round(v / 2**20, 1) if v is not None else ""
     with open(arquivo, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=CAMPOS_CONSOLIDADO)
@@ -251,6 +269,9 @@ def consolidar(arquivo: Path, r: dict, rep: int) -> None:
             "convergencia_s": t.get("convergencia_s"),
             "wal_max_falha_mb": mb(col["wal_max_bytes"]["falha"]),
             "slot_max_falha_mb": mb(col.get("slot_retido_max_bytes", {}).get("falha")),
+            "recuperados_retentativa": rec.get("recuperados_por_retentativa", ""),
+            "declarados_perdidos": rec.get("declarados_perdidos", ""),
+            "reinicios_auto_conector": rec.get("reinicios_automaticos", ""),
         })
 
 
@@ -272,7 +293,10 @@ def main() -> None:
     p.add_argument("--parada", choices=["stop", "kill", "pause"], default="stop",
                    help="stop = SIGTERM, kill = SIGKILL, pause = processo congelado e inalcançável")
     p.add_argument("--reiniciar-conector-falho", action="store_true",
-                   help="no CDC, reinicia a tarefa do Debezium se ela terminar em FAILED (registra a intervenção)")
+                   help="no CDC, intervenção manual: reinicia a tarefa do Debezium em FAILED depois que o "
+                        "reinício automático desistir (registra a intervenção)")
+    p.add_argument("--sem-recuperacao", action="store_true",
+                   help="desliga a retentativa do Software A e o reinício automático do Debezium no Software B")
     p.add_argument("--max-em-voo", type=int, default=2000)
     p.add_argument("--sem-reset", action="store_true", help="não reinicializa o ambiente antes de cada execução")
     p.add_argument("--build", action="store_true", help="reconstrói a imagem dos serviços ao subir")
@@ -282,6 +306,7 @@ def main() -> None:
     janelas = [float(x) for x in a.janela_segundos.split(",")] if a.janela_segundos else \
         [float(x) * 60 for x in a.janelas.split(",")]
     modos = ["domain-events", "cdc"] if a.modo == "ambos" else [a.modo]
+    amb.definir_recuperacao(not a.sem_recuperacao)
 
     saida = amb.RAIZ / a.saida
     saida.mkdir(parents=True, exist_ok=True)

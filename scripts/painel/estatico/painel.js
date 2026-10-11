@@ -301,7 +301,10 @@ function desenharDetalhe() {
     pares.push(["/healthz", h.ok ? `ok · ${fmt(h.ms, 1)} ms` : esc(h.erro || "sem resposta")]);
     pares.push(["pedidos criados", fmt(m.orders_created_total)], ["transições", fmt(m.order_status_changes_total)],
       ["erros HTTP", fmt(m.http_errors_total)]);
-    if (E?.modo === "domain-events") pares.push(["eventos publicados", fmt(m.events_published_total)], ["falhas de publicação", fmt(m.events_publish_failed_total)]);
+    if (E?.modo === "domain-events") pares.push(["eventos publicados", fmt(m.events_published_total)], ["falhas na publicação síncrona", fmt(m.events_publish_failed_total)],
+      ["esperando retentativa", fmt(m.events_retry_pending)], ["confirmados com atraso", fmt(m.events_late_confirmed_total)],
+      ["recuperados por retentativa", fmt(m.events_retry_recovered_total)],
+      ["declarados perdidos", fmt(m.events_declared_lost_total)]);
   } else if (selecionado === "consumidores") {
     const g = E?.grupo;
     pares.push(["estado no coordenador", g ? esc(g.estado) : "sem resposta"], ["membros", g ? fmt(g.membros) : "–"]);
@@ -326,6 +329,9 @@ function desenharDetalhe() {
   } else if (selecionado === "connect" && E?.conector) {
     pares.push(["tarefa", esc(E.conector.estado)]);
     if (E.conector.erro) pares.push(["erro", esc(E.conector.erro)]);
+    const v = E.conector.vigia;
+    if (v) pares.push(["reinícios automáticos", fmt(v.connector_auto_restarts_total)],
+      ["reinício automático", v.connector_restart_gave_up ? "desistiu: intervenção manual necessária" : `${fmt(v.connector_restart_attempts)} tentativas usadas`]);
   }
   let html = `<h2>${esc(titulo)}</h2>` + linhas(pares);
   const no = NOS[selecionado];
@@ -438,6 +444,7 @@ formC1.addEventListener("submit", (ev) => {
   const p = Object.fromEntries(fd);
   p.brokers = fd.getAll("brokers");
   p.reiniciar_conector_falho = fd.has("reiniciar_conector_falho");
+  p.sem_recuperacao = fd.has("sem_recuperacao");
   if (confirm("O Cenário 1 reinicializa o ambiente (down -v) antes de cada execução. Continuar?")) iniciarTrabalho("cenario1", p);
 });
 // Formulários dos cenários 2, 3 e 5: os campos têm os mesmos nomes dos parâmetros do servidor.

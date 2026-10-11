@@ -21,6 +21,7 @@ RAIZ = Path(__file__).resolve().parents[2]
 API_URL = os.environ.get("API_URL", "http://localhost:8080")
 CONSUMIDOR_URL = os.environ.get("CONSUMIDOR_URL", "http://localhost:8081")
 CONNECT_URL = os.environ.get("CONNECT_URL", "http://localhost:8083")
+VIGIA_URL = os.environ.get("VIGIA_URL", "http://localhost:8086")
 ORIGEM_DSN = os.environ.get("ORIGEM_DSN", "postgresql://olist:olist@localhost:5432/olist")
 DESTINO_DSN = os.environ.get("DESTINO_DSN", "postgresql://olist:olist@localhost:5433/olist")
 CONECTOR = os.environ.get("CONNECTOR_NAME", "olist-origem")
@@ -91,6 +92,38 @@ async def ligar_async(*servicos: str) -> tuple[int, str]:
                                                 stderr=asyncio.subprocess.STDOUT)
     out, _ = await proc.communicate()
     return proc.returncode, out.decode(errors="replace")
+
+
+# Mecanismos de recuperação automática (M1 no Software A, M4 no Software B), com a mesma
+# política nos dois: tentativas, espera antes da primeira e multiplicador das seguintes.
+RECUPERACAO_PADRAO = {
+    "PUBLISH_RETRY_ATTEMPTS": "3", "PUBLISH_RETRY_BACKOFF": "1s", "PUBLISH_RETRY_MULTIPLIER": "2",
+    "PUBLISH_RETRY_BUFFER": "10000",
+    "CONNECT_RESTART_ATTEMPTS": "3", "CONNECT_RESTART_BACKOFF": "1s", "CONNECT_RESTART_MULTIPLIER": "2",
+    "CONNECT_RESTART_RESET_AFTER": "60s",
+}
+
+
+def definir_recuperacao(ligada: bool) -> None:
+    """Liga ou desliga a recuperação automática nos próximos `up` (as variáveis do ambiente do
+    processo valem mais que o .env para o Compose). Desligada, os dois softwares voltam ao
+    comportamento sem retentativa: o A descarta o evento e o B deixa a tarefa em FAILED."""
+    if not ligada:
+        os.environ["PUBLISH_RETRY_ATTEMPTS"] = "0"
+        os.environ["CONNECT_RESTART_ATTEMPTS"] = "0"
+
+
+def parametros_recuperacao() -> dict[str, str]:
+    """Valores efetivos da recuperação automática, para registrar nos marcos de cada execução:
+    variável do processo, senão o .env da raiz, senão o padrão do docker-compose.yml."""
+    arquivo = {}
+    env = RAIZ / ".env"
+    if env.exists():
+        for linha in env.read_text().splitlines():
+            chave, sep, valor = linha.partition("=")
+            if sep and not linha.lstrip().startswith("#"):
+                arquivo[chave.strip()] = valor.strip()
+    return {k: os.environ.get(k) or arquivo.get(k) or v for k, v in RECUPERACAO_PADRAO.items()}
 
 
 def reiniciar_ambiente(modo: str, build: bool = False) -> None:

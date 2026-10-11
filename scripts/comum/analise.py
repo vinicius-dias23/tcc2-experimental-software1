@@ -26,6 +26,13 @@ Seções extras, conforme o cenário gravado em marcos.json:
   resolvidas pela versão do pedido na origem, que sobe 1 a cada commit.
 - Cenário 5 (queda de consumidor): rebalanceamentos e tempo fora do estado Stable, lidos de
   grupo.csv, e expulsões por max.poll.interval.
+
+Seção "recuperacao", em todos os cenários: o que a recuperação automática fez. No Software A,
+eventos confirmados pelo broker depois que a requisição desistiu de esperar, eventos publicados
+por uma retentativa e eventos declarados perdidos; a diferença entre a
+perda medida pelo oráculo e os declarados perdidos é a perda que nenhum contador registrou
+(ex.: eventos na fila de retentativa quando o processo morreu). No Software B, reinícios
+automáticos da tarefa do Debezium e se o vigia desistiu.
 """
 
 from __future__ import annotations
@@ -258,6 +265,7 @@ def analisar(pasta: Path) -> dict:
         "efeito_colateral": colateral,
         **extras,
     }
+    resumo["recuperacao"] = _recuperacao(m, serie, resumo["integridade"]["perda_eventos"])
     (pasta / "resumo.json").write_text(json.dumps(resumo, indent=2, ensure_ascii=False))
     return resumo
 
@@ -365,6 +373,43 @@ def _promocao(pasta: Path, m: dict, ledger: list[dict], msgs: list[dict], origem
     }
 
 
+def _acumulado(serie: list[dict], campo: str) -> int | None:
+    """Total de um contador ao longo da execução, somando o que foi contado antes de cada
+    reinício do processo (o /metrics volta a zero quando o serviço recomeça)."""
+    total, anterior, visto = 0.0, 0.0, False
+    for s in serie:
+        if s.get(campo) in ("", None):
+            continue
+        v, visto = float(s[campo]), True
+        total += v - anterior if v >= anterior else v
+        anterior = v
+    return int(total) if visto else None
+
+
+def _recuperacao(m: dict, serie: list[dict], perda_eventos: int) -> dict:
+    politica = m.get("parametros", {}).get("recuperacao_automatica", {})
+    if m["modo"] == "domain-events":
+        declarados = _acumulado(serie, "declarados_perdidos_total")
+        pend = [int(float(s["retentativa_pendentes"])) for s in serie if s.get("retentativa_pendentes") not in ("", None)]
+        return {
+            "politica": {k: v for k, v in politica.items() if k.startswith("PUBLISH_RETRY")},
+            "confirmados_com_atraso": _acumulado(serie, "confirmados_com_atraso_total"),
+            "recuperados_por_retentativa": _acumulado(serie, "retentativa_recuperados_total"),
+            "declarados_perdidos": declarados,
+            "pendentes_max": max(pend) if pend else None,
+            "perda_nao_declarada": perda_eventos - declarados if declarados is not None else None,
+        }
+    desistiu = [s for s in serie if str(s.get("conector_vigia_desistiu", "")) in ("1", "1.0")]
+    return {
+        "politica": {k: v for k, v in politica.items() if k.startswith("CONNECT_RESTART")},
+        "reinicios_automaticos": _acumulado(serie, "conector_reinicios_auto_total"),
+        "vigia_desistiu": bool(desistiu),
+        "desistencia_apos_falha_s": round(float(desistiu[0]["t"]) - m["falha_inicio"], 2)
+        if desistiu and m.get("falha_inicio") else None,
+        "intervencao_manual": "intervencao_conector" in m,
+    }
+
+
 def _grupo(pasta: Path, m: dict, serie: list[dict]) -> dict:
     """Cenário 5: rebalanceamentos e tempo fora do estado Stable por fase, a partir de grupo.csv."""
     linhas = [r for r in _ler(pasta / "grupo.csv") if r["estado"]]
@@ -404,7 +449,7 @@ def imprimir(r: dict) -> None:
     print(f"  divergência final={i['divergencia_final']}")
     print(f"  tempos={r['tempos']}")
     print(f"  efeito colateral={r['efeito_colateral']}")
-    for chave in ("ambiguas", "reinicios", "promocao", "grupo"):
+    for chave in ("ambiguas", "reinicios", "promocao", "grupo", "recuperacao"):
         if chave in r:
             print(f"  {chave}={r[chave]}")
 

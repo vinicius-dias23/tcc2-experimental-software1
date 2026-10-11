@@ -50,7 +50,8 @@ CENARIOS = {"cenario1", "cenario2", "cenario3", "cenario5"}
 
 # Métricas lidas do /metrics, acumuladas como séries de taxa (por segundo).
 METRICAS_ORDER = ["orders_created_total", "order_status_changes_total", "http_errors_total",
-                  "events_published_total", "events_publish_failed_total"]
+                  "events_published_total", "events_publish_failed_total", "events_retry_pending",
+                  "events_late_confirmed_total", "events_retry_recovered_total", "events_declared_lost_total"]
 METRICAS_SHIPPING = ["messages_consumed_total", "messages_applied_total", "messages_invalid_total",
                      "db_errors_total"]
 HISTORICO_S = 600
@@ -226,8 +227,9 @@ class Painel:
                     return {"estado": "NAO_REGISTRADO"}
                 st = await r.json()
             tarefas = st.get("tasks") or []
+            vigia = await amb.ler_metricas(sessao, amb.VIGIA_URL)
             return {"estado": tarefas[0]["state"] if tarefas else st["connector"]["state"],
-                    "conector": st["connector"]["state"],
+                    "conector": st["connector"]["state"], "vigia": vigia or None,
                     "erro": (tarefas[0].get("trace") or "").splitlines()[0][:300] if tarefas and tarefas[0].get("trace") else None}
         except Exception:
             return {"estado": "INALCANCAVEL"}
@@ -465,6 +467,8 @@ def _montar_comando(tipo: str, p: dict) -> tuple[list[str], str]:
                 "--taxa", _num(p, "taxa", 100, 1, 5000), "--parada", parada, "--brokers", ",".join(brokers)]
         if p.get("reiniciar_conector_falho"):
             args.append("--reiniciar-conector-falho")
+        if p.get("sem_recuperacao"):
+            args.append("--sem-recuperacao")
         return args, f"Cenário 1 ({modo}, janela de {janela}s, {parada} {','.join(brokers)})"
     if tipo in ("cenario2", "cenario3", "cenario5"):
         modo = p.get("modo")
@@ -474,6 +478,8 @@ def _montar_comando(tipo: str, p: dict) -> tuple[list[str], str]:
                   "--recuperacao", _num(p, "recuperacao", 60, 0, 86400), "--taxa", _num(p, "taxa", 100, 1, 5000)]
         if p.get("reiniciar_conector_falho"):
             comuns.append("--reiniciar-conector-falho")
+        if p.get("sem_recuperacao"):
+            comuns.append("--sem-recuperacao")
     if tipo == "cenario2":
         atraso, promo = _num(p, "atraso_replicacao", 5, 0, 3600), _num(p, "atraso_promocao", 5, 0, 3600)
         return (["scripts.cenario2.promocao_replica", *comuns, "--atraso-replicacao", atraso,
